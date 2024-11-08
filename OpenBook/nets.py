@@ -32,6 +32,8 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 import jmp
+import numpy as np
+import copy
 import time
 import types
 import warnings
@@ -39,8 +41,7 @@ import warnings
 from haiku._src import basic
 from haiku._src import initializers
 from haiku._src import module
-import numpy as np
-import copy
+
 
 # If you are forking replace this with `import haiku as hk`.
 # hk = types.ModuleType("haiku")
@@ -95,69 +96,6 @@ class MessagePassingStateChunked:
     lstm_state: Optional[hk.LSTMState]
 
 
-class Bank_selfAtt(hk.Module):
-    def __init__(self, name=None):
-        super().__init__(name=name)
-
-    def __call__(self, bank_list):
-        # print(bank_list.shape)
-        nb_batch = bank_list.shape[0]
-        bank_list = jnp.expand_dims(bank_list, axis=-1)  # 30, 128, 1
-        inner_Linear = hk.Linear(4)
-        bank_list = inner_Linear(bank_list)  # (30, 128, 4)
-        # print(bank_list.shape)
-
-        bank_list = jnp.reshape(bank_list, (nb_batch, 128 * 4))  # (30, 512)
-        H = 128 * 4
-        scale = 1.0 / H
-
-        Wq = hk.Linear(H)
-        Wk = hk.Linear(H)
-        Wv = hk.Linear(H)
-
-        Q = Wq(bank_list)  # 30, 128 * 4
-        K = Wk(bank_list)  # 30, 128 * 4
-        V = Wv(bank_list)  # 30, 128 * 4
-
-        K = jnp.transpose(K, (1, 0))
-        QK = jnp.matmul(Q, K)  # 30, 30 第一个是查询次数，第二个是被查询的个数，也就是和为1的那个last_dim
-        QK = QK * scale
-        QK = jax.nn.softmax(QK, axis=-1)
-        QKV = jnp.matmul(QK, V)  # 30, 128 * 4
-
-        # 第一组DataPoint之间的注意力做完后，还要加MLP或者别的东西吗？先只让原来的加上，或者用结果直接往后做？先直接加
-        QKV = bank_list + QKV
-        Ln_dp = hk.LayerNorm(axis=-1, param_axis=-1, create_scale=True, create_offset=True)
-        QKV = Ln_dp(QKV)  # 这个LN未来可测一下作用大不大
-        # 接下来做 特征之间的注意力。
-        DP = jnp.reshape(QKV, (nb_batch, 128, 4))  # (30, 128, 4)
-
-        scale1 = 1.0 / 8
-        Wq1 = hk.Linear(8)  # 4->8  QK都是8做点积
-        Wk1 = hk.Linear(8)  # 4->8
-        Wv1 = hk.Linear(4)  # 4->4
-
-        Q1 = Wq1(DP)  # 30, 128, 8
-        K1 = Wk1(DP)  # 30, 128, 8
-        V1 = Wv1(DP)  # 30, 128, 4
-        K1 = jnp.transpose(K1, (0, 2, 1))  # 30, 8 128
-        QK1 = jnp.matmul(Q1, K1)  # 30, 128, 128  # 最后一个128是lastdim，符合我们的设想，拿一组特征当bank，一共128个这样的特征。
-        QK1 = QK1 * scale1
-        QK1 = jax.nn.softmax(QK1, axis=-1)
-        assert QK1.shape == (nb_batch, 128, 128)
-        assert V1.shape == (nb_batch, 128, 4)
-        QKV1 = jnp.matmul(QK1, V1)  # 30, 128, 4
-        # 残差网络 or ...Ln是否要实现？过了最后这个Linear和reshape再实现，因为bank里的数字要搞小一点。
-        QKV1 = QKV1 + DP
-
-        out_Linear = hk.Linear(1)
-        QKV1 = out_Linear(QKV1)  # 30, 128, 1
-        QKV1 = jnp.reshape(QKV1, (nb_batch, 128))
-        Ln_bank = hk.LayerNorm(axis=-1, param_axis=-1, create_scale=True, create_offset=True)
-        QKV1 = Ln_bank(QKV1)
-        return QKV1
-
-
 class MultiHeadAttention2(hk.Module):
     """Multi-headed attention (MHA) module.
 
@@ -210,21 +148,7 @@ class MultiHeadAttention2(hk.Module):
         self.value_size = value_size or key_size
         self.model_size = model_size or key_size * num_heads
 
-        # Backwards-compatibility for w_init_scale.
 
-    #        if w_init_scale is not None:
-    #            warnings.warn(
-    #                "w_init_scale is deprecated; please pass an explicit weight "
-    #                "initialiser instead.", DeprecationWarning)
-    #        if w_init and w_init_scale:
-    #            raise ValueError("Please provide only `w_init`, not `w_init_scale`.")
-    #        if w_init is None and w_init_scale is None:
-    #            raise ValueError("Please provide a weight initializer: `w_init`. "
-    #                             "`w_init` will become mandatory once `w_init_scale` is "
-    #                             "fully deprecated.")
-    #        if w_init is None:
-    #            w_init = hk.initializers.VarianceScaling(w_init_scale)
-    #        self.w_init = w_init
 
     def __call__(
             self,
@@ -260,7 +184,7 @@ class MultiHeadAttention2(hk.Module):
 
         # Compute attention weights.
         attn_logits = jnp.einsum("...thd,...Thd->...htT", query_heads, key_heads)
-        attn_logits = attn_logits / np.sqrt(self.key_size).astype(key.dtype)  # 0120 hofer  np.sqrt().astype(key.dtype)
+        attn_logits = attn_logits / np.sqrt(self.key_size).astype(key.dtype)
         if mask is not None:
             if mask.ndim != attn_logits.ndim:
                 raise ValueError(
@@ -269,36 +193,10 @@ class MultiHeadAttention2(hk.Module):
                 )
             attn_logits = jnp.where(mask, attn_logits, -1e30)
 
-        # x = x.at[idx].set(y)
-        # =====hofer2
-        # sorted_indices = jnp.argsort(-attn_logits, axis=-1)
-        # top_indices = sorted_indices[..., -10:]  # 倒数10个赋值0  到时候改这就好了。
-        # if not leading_dims:  # 空列表 说明没有batch，那就是3维的索引
-        # attn_logits = attn_logits.at[
-        # np.arange(attn_logits.shape[0])[:, None, None], np.arange(attn_logits.shape[1])[:,
-        # None], top_indices].set(-1e30)  # 最难写的一步，索引。。
-        # else:  # 否则就是4维的索引，含有batch
-        # attn_logits = attn_logits.at[
-        # np.arange(attn_logits.shape[0])[:, None, None, None], np.arange(attn_logits.shape[1])[:, None,
-        # None], np.arange(
-        # attn_logits.shape[2])[:, None], top_indices].set(-1e30)
-        # ====hofer2
-        attn_weights = jax.nn.softmax(attn_logits)  # [H, T', T]  0119hofer
-        #        attn_weights = attn_logits# 0119hofer
-        #        jax.debug.print('hofer================={x}',x =attn_weights[...,:3])
-        # =====hofer
-        #        sorted_indices = jnp.argsort(-attn_weights, axis=-1)
-        #        top_indices = sorted_indices[..., -5:]  # 倒数5个赋值0  到时候改这就好了。
-        #        if not leading_dims:  # 空列表 说明没有batch，那就是3维的索引
-        #            attn_weights = attn_weights.at[np.arange(attn_weights.shape[0])[:, None, None],
-        #            np.arange(attn_weights.shape[1])[:,None], top_indices].set(0.0)
-        #        else:  # 否则就是4维的索引，含有batch
-        #            attn_weights = attn_weights.at[np.arange(attn_weights.shape[0])[:, None, None, None],
-        #            np.arange(attn_weights.shape[1])[:, None,None],
-        #            np.arange(attn_weights.shape[2])[:, None], top_indices].set(0.0)
-        # ====hofer
-        # Weight the values by the attention and flatten the head vectors.
-        attn = jnp.einsum("...htT,...Thd->...thd", attn_weights, value_heads)  # 小t是查询次数，输出为(t,head,v映射的维度)
+
+        attn_weights = jax.nn.softmax(attn_logits)  # [H, T', T]
+
+        attn = jnp.einsum("...htT,...Thd->...thd", attn_weights, value_heads)  #
         attn = jnp.reshape(attn, (*leading_dims, sequence_length, -1))  # [T', H*V]
 
         # Apply another projection to get the final embeddings.
@@ -320,16 +218,16 @@ class MultiHeadAttention2(hk.Module):
 class AttNet(hk.Module):
     def __init__(self, model_size=128, name=None):
         super().__init__(name=name)
-        self.Mulatt = MultiHeadAttention2(1, key_size=128, value_size=128,  # 这俩值记得改回128 0521 为了能让quickselect跑
+        self.Mulatt = MultiHeadAttention2(1, key_size=128, value_size=128,
                                           model_size=model_size)
 
     def __call__(self, x, y, z):
-        out, weight = self.Mulatt(x, y, z)  # 要改回去的话，这里要写成 hk.MultiHeadAttention
-        # x = hk.LayerNorm(axis=-1, param_axis=-1, create_scale=True, create_offset=True)(x)  # hofer 1226
-        # processor模式下 modelsize是128 decoder模式下，对于et和ht不同，一个是256一个是384
+        out, weight = self.Mulatt(x, y, z)
         return out, weight
+
+
 class GateNet(hk.Module):
-    def __init__(self,name=None):
+    def __init__(self, name=None):
         super().__init__(name=name)
         self.o1 = hk.Linear(128)
         self.gate1 = hk.Linear(128)
@@ -342,6 +240,7 @@ class GateNet(hk.Module):
         gate = jax.nn.sigmoid(self.gate3(jax.nn.relu(self.gate1(nxt_hidden) + self.gate2(msg_node))))
         ret = ret * gate + nxt_hidden * (1 - gate)
         return ret
+
 
 class Net(hk.Module):
     """Building blocks (networks) used to encode and decode messages."""
@@ -506,14 +405,9 @@ class Net(hk.Module):
           A 2-tuple with (output predictions, hint predictions)
           for the selected algorithm.
         """
-        #        print(f'algorithm_index{algorithm_index}')  # hofer 0109
-        #        print('=========')
 
         self.bankencoders = self._construct_encoders()
         node_bank = []
-        # edge_bank = []
-        # graph_bank = []
-        # Knode_bank = []
         bank_list = []
         if algorithm_index == -1:
             algorithm_indices = range(len(features_list))
@@ -523,102 +417,64 @@ class Net(hk.Module):
 
         self.encoders, self.decoders = self._construct_single_encoders_decoders(algorithm_index,
                                                                                 self.spec[algorithm_index])
-        # 0201 hofer 测试原版代码
-        # 0203 step=2  hint中dp均为，2*batch*f...
-        # use_bank = False
+
         if use_bank:
-            for algo_index, feedback in enumerate(bank_feed):  # 这个for头就不动了
-                # 把一个算法的信息聚合成一个128的信息
-                inputs = feedback.features.inputs  # bank_batch*f...
-                hints = feedback.features.hints  # 原为bank_batch*f...  现为step*bank_batch*f
-                # lengths = feedback.features.lengths  # 这句话属是没用 暂时注释掉
+            for algo_index, feedback in enumerate(bank_feed):
+                inputs = feedback.features.inputs
+                hints = feedback.features.hints
                 batch_size, nb_nodes = _data_dimensions(feedback.features)
-                # nb_mp_steps = 16  # 因为我们这个step现在固定就是16步了
-
-                input_node_fts = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))  # b*n*h  一个样本有n个h，一个节点的特征是h
+                input_node_fts = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))
                 input_edge_fts = jnp.zeros(
-                    (batch_size, nb_nodes, nb_nodes, self.hidden_dim))  # b*n*n*h  一个边的特征是h，n个点有n*n个边。
-                input_graph_fts = jnp.zeros((batch_size, self.hidden_dim))  # bh
-
-
-                hint0_node_fts = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))  # b*n*h  一个样本有n个h，一个节点的特征是h
-                # hint0_edge_fts = jnp.zeros(
-                #     (batch_size, nb_nodes, nb_nodes, self.hidden_dim))  # b*n*n*h  一个边的特征是h，n个点有n*n个边。
-                # hint0_graph_fts = jnp.zeros((batch_size, self.hidden_dim))  # bh
+                    (batch_size, nb_nodes, nb_nodes, self.hidden_dim))
+                input_graph_fts = jnp.zeros((batch_size, self.hidden_dim))
+                hint0_node_fts = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))
 
                 encs = self.bankencoders[algo_index]
-                # if algo_index == algorithm_index:
-                #     encs = self.encoders[0]
-
-                # 对input进行encoder
                 for newdp in inputs:
-                    # data类型可能有bug
+
                     newdp = encoders.preprocess(newdp, nb_nodes)
                     assert newdp.type_ != _Type.SOFT_POINTER
                     encoder = encs[newdp.name]
                     input_node_fts = encoders.accum_node_fts(encoder, newdp, input_node_fts)  # bnh
                     input_edge_fts = encoders.accum_edge_fts(encoder, newdp, input_edge_fts)  # bnnh
                     input_graph_fts = encoders.accum_graph_fts(encoder, newdp, input_graph_fts)  # bh
-                # 对hint的第一步进行encoder，通过更改accum的实现做到的，结束后和input内容相加。
+
                 for dp in hints:
-                    dp = encoders.preprocess(dp, nb_nodes)  # 带着s维度去做这个hk.onehot会不会有问题？ 没问题应该这个功能是把每个数变成了一个向量
+                    dp = encoders.preprocess(dp, nb_nodes)
                     assert dp.type_ != _Type.SOFT_POINTER
-                    encoder = encs[dp.name]  # 下面都调用的是_step0 ，只会处理第0步的信息。a
+                    encoder = encs[dp.name]
                     hint0_node_fts = encoders.accum_node_fts_step0(encoder, dp, hint0_node_fts)  # bnh
-                    # hint0_edge_fts = encoders.accum_edge_fts_step0(encoder, dp, hint0_edge_fts)  # bnnh  dp.name dp.location node  dp.data.shape  step*batch*node
-                    # hint0_graph_fts = encoders.accum_graph_fts_step0(encoder, dp, hint0_graph_fts)  # bh
 
                 hint0_node_fts += input_node_fts  # bnh
-                # hint0_edge_fts += input_edge_fts  # bnnh  这个边的和图的暂且先不用了。
-                # hint0_graph_fts += input_graph_fts  # bh
-                # hint0_node_fts = jnp.sum(hint0_node_fts, axis=1) / nb_nodes
-                # 随机切片
                 rand_node = np.random.randint(0, nb_nodes)
-                hint0_node_fts = hint0_node_fts[:,rand_node] # bh
-                
+                hint0_node_fts = hint0_node_fts[:, rand_node]  # bh
+
                 assert hint0_node_fts.shape == (batch_size, 128)
 
-                # 对全部的hints进行encoder
+
                 for dp in hints:
                     lengths = feedback.features.lengths
                     tempdata = jnp.sum(dp.data, axis=0)
                     dp.data = tempdata / _iso_expand_to(lengths, tempdata)
-                    dp = encoders.preprocess(dp, nb_nodes)  # 带着s维度去做这个hk.onehot会不会有问题？ 没问题应该这个功能是把每个数变成了一个向量
+                    dp = encoders.preprocess(dp, nb_nodes)
                     assert dp.type_ != _Type.SOFT_POINTER
-                    encoder = encs[dp.name]  # 从字典中索引出这个name对应的 “encoder们”   encoder是个list。
+                    encoder = encs[dp.name]
                     input_node_fts = encoders.accum_node_fts(encoder, dp, input_node_fts)  # bnh
                     input_edge_fts = encoders.accum_edge_fts(encoder, dp, input_edge_fts)  # bnnh
                     input_graph_fts = encoders.accum_graph_fts(encoder, dp, input_graph_fts)  # bh
 
-                # input_node_fts = input_node_fts[:, rand_node]  # bnh->bh
                 input_node_fts = jnp.sum(input_node_fts, axis=1)  # bnh->bh
-                input_edge_fts = jnp.sum(input_edge_fts, axis=(1, 2))  # bnnh->bh
-                # input_graph_fts = jnp.sum(input_graph_fts, axis=(0))  # bh->bh
-                # hofer 0117
-                #            one_hot_vector = jnp.zeros(bank_length)
-                #            one_hot_vector = one_hot_vector.at[algo_index].set(1.0)
-                #            pos_embedding = pos_Linear(one_hot_vector)
-                #            node_bank.append(input_node_fts / (batch_size * nb_nodes) + pos_embedding)
-                #            edge_bank.append(input_edge_fts / batch_size + pos_embedding)
-                #            graph_bank.append(input_graph_fts / batch_size + pos_embedding)
-                # hofer 0117
-                # before 0117
+
                 temp = input_node_fts / (nb_nodes)
-                # temp = input_node_fts
-                #            temp = jax.nn.tanh(nodehint_Linear(temp))
-                #            temp = jax.nn.relu(temp)
+
                 temp = jax.nn.tanh(temp)
                 for i in range(temp.shape[0]):
                     t = temp[i]
                     node_bank.append(t)
 
-
         bank_list.append(node_bank)  # 0
 
 
-        # hofer 0120
-        # 创建3个ATT网络  change by hofer 12.11
-        # 不该是3个，而是每个算法对应一套。  # hofer 1226
         qkv_list = []
         for i in [1]:
             node_Attention1 = AttNet(model_size=128, name='node_Q_Attbank')
@@ -627,19 +483,11 @@ class Net(hk.Module):
 
         gate_list = []
         for i in range(1):
-            gatenet = GateNet(name = f'gate_algo_{i}_')
+            gatenet = GateNet(name=f'gate_algo_{i}_')
             gate_list.append(gatenet)
-        #     for enc in self.encoders:
-        #         for networks in enc.values():
-        #             for network in networks:
-        #                 hk.mixed_precision.set_policy(network,my_policy)
-        #     for dec in self.decoders:
-        #         for networks in dec.values():
-        #             for network in networks:
-        #                 hk.mixed_precision.set_policy(network,my_policy)
-        # hk.mixed_precision.set_policy(dec,my_policy)
+
         self.processor = self.processor_factory(self.hidden_dim)
-        # hk.mixed_precision.set_policy(self.processor,my_policy)
+
 
         # Optionally construct LSTM.
         if self.use_lstm:
@@ -657,7 +505,7 @@ class Net(hk.Module):
             lengths = features.lengths
 
             batch_size, nb_nodes = _data_dimensions(features)
-            #            print(f'batch_size:{batch_size}, nb_nodes:{nb_nodes}')
+
 
             nb_mp_steps = max(1, hints[0].data.shape[0] - 1)
             hiddens = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))
@@ -730,7 +578,7 @@ class Net(hk.Module):
         else:
             output_preds = output_mp_state.output_preds
         hint_preds = invert(accum_mp_state.hint_preds)
-        # weight维度:node节点：step步数*8*node个数*30  对于edge和graph：step*8*batch*30
+
         return output_preds, hint_preds, accum_mp_state.weight
 
     def _construct_encoders(self):
@@ -738,29 +586,26 @@ class Net(hk.Module):
         encoders_ = []
         enc_algo_idx = None
         for (algo_idx, spec) in enumerate(
-                self.spec):  # 30个算法的list，每个元素对应一个算法的Spec字典Dict[strname:(str,str,str)]  hofer 1221
+                self.spec):
             enc = {}
-            #            dec = {}
             for name, (stage, loc, t) in spec.items():
                 if stage == _Stage.INPUT or (
                         stage == _Stage.HINT and self.encode_hints):
                     # Build input encoders.
-                    if name == specs.ALGO_IDX_INPUT_NAME:  # 不知道这条分支的意义，ALGO_IDX_INPUT_NAME = 'algo_idx'。没有谁的名字等于这个吧。。
+                    if name == specs.ALGO_IDX_INPUT_NAME:
                         if enc_algo_idx is None:
                             enc_algo_idx = [hk.Linear(self.hidden_dim,
                                                       name=f'{name}_enc_linear_bank')]
                         enc[name] = enc_algo_idx
-                    else:  # 给enc字典里加键值对，key是代表hint或者input的name，value是对应的encoder网络列表，当然大部分人的这个列表长度就是1。
-                        enc[name] = encoders.construct_encoders(  # 返回值是个列表，代表这个'i' 'pos'对应的encoder们，有的可能对应俩线性层。
-                            # 返回的列表又成了enc字典的键值对。
+                    else:
+                        enc[name] = encoders.construct_encoders(
                             stage, loc, t, hidden_dim=self.hidden_dim,
                             init=self.encoder_init,
-                            name=f'algo_{algo_idx}_{name}_bank')  # algo_0_j   algo_15_pred  诸如此类
+                            name=f'algo_{algo_idx}_{name}_bank')
 
             encoders_.append(enc)
 
-        return encoders_  # 返回了俩list，list里面有30个字典。字典里是 name : list or tuple这样的键值对
-        # 这里的list和tuple装的是这个name对应的encoder或者decoder需要的网络们
+        return encoders_
 
     def _construct_encoders_decoders(self):
         """Constructs encoders and decoders, separate for each algorithm."""
@@ -768,7 +613,7 @@ class Net(hk.Module):
         decoders_ = []
         enc_algo_idx = None
 
-        for (algo_idx, spec) in enumerate(self.spec):  # algo_idx, spec这个改成参数，然后for循环去了
+        for (algo_idx, spec) in enumerate(self.spec):
             enc = {}
             dec = {}
             for name, (stage, loc, t) in spec.items():
@@ -806,7 +651,6 @@ class Net(hk.Module):
         decoders_ = []
         enc_algo_idx = None
 
-        # for (algo_idx, spec) in enumerate(self.spec):  # algo_idx, spec这个改成参数，然后for循环去了
         enc = {}
         dec = {}
         for name, (stage, loc, t) in spec.items():
@@ -883,33 +727,12 @@ class Net(hk.Module):
                 except Exception as e:
                     raise Exception(f'Failed to process {dp}') from e
 
-        # decoderbank的输入  input+当前的hint，当前的hint就相当于是某个新算法开始的状态。
-        query_input = node_fts.copy()  # bnh
-        # query_input = np.sum(query_input, axis=1)
 
-        # 自注意力网络引进，lookup出额外的特征。
-        # nodebank_list = jnp.stack(bank_list[0])
-        # edgebank_list = jnp.stack(bank_list[1])
-        # graphbank_list = jnp.stack(bank_list[2])
-        #
-        # node_input = jnp.sum(node_fts, axis=(1))  # bh
-        # edge_input = jnp.sum(edge_fts, axis=(1, 2))  # bh
-        # graph_input = graph_fts  # bh
-        #
-        # node_res = Att['node'](node_input, nodebank_list)  # bh
-        # edge_res = Att['edge'](edge_input, edgebank_list)
-        # graph_res = Att['graph'](graph_input, graphbank_list)
-        #
-        # # 简单的广播方式相加
-        #
-        # node_fts += jnp.expand_dims(node_res, 1)  # bnh + bh扩维
-        # edge_fts += jnp.expand_dims(edge_res, (1, 2))  # bnnh  +bh扩维
-        # graph_fts += graph_res  # bh
 
         # PROCESS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         nxt_hidden = hidden
         for _ in range(self.nb_msg_passing_steps):
-            nxt_hidden, nxt_edge, weight = self.processor(  # weight是个元组，包含了一步的多个权重信息
+            nxt_hidden, nxt_edge, weight = self.processor(
                 node_fts,
                 edge_fts,
                 graph_fts,
@@ -932,62 +755,30 @@ class Net(hk.Module):
         else:
             nxt_lstm_state = None
 
-        
-
         nodebank_list = jnp.stack(bank_list[0])
-        # edgebank_list = jnp.stack(bank_list[1])  # 取出边和图的bank，shape = 30*h 当作ATT的y使用。
-        # graphbank_list = jnp.stack(bank_list[2])
-        ln1 = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
-        # ln2 = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
-        # ln3 = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
-        ln4 = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
-        nodebank_list = ln1(nodebank_list)
-        # edgebank_list = ln2(edgebank_list)
-        # graphbank_list = ln3(graphbank_list)
 
-        
-        # nodeBankAttNet = Bank_selfAtt(name='nodebank_de')
-        # edgeBankAttNet = Bank_selfAtt(name='edgebank_de')
-        # graphBankAttNet = Bank_selfAtt(name='graphbank_de')
-        
-        # nodebank_list = nodeBankAttNet(nodebank_list)
-        
-        # edgebank_list = edgeBankAttNet(edgebank_list)
-        # graphbank_list = graphBankAttNet(graphbank_list)
-        # gate_node = hk.Linear(h_t.shape[-1], name='gate_node')
+        ln1 = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
+        nodebank_list = ln1(nodebank_list)
+
 
         if nxt_edge is not None:
             e_t = jnp.concatenate([edge_fts, nxt_edge], axis=-1)
         else:
             e_t = edge_fts
 
-        # 第一个实现版本 到bank里查询并相加1
-        # msg_node, weight1 = Att['node1'](h_t, nodebank_list)  # bn 3h
-        # msg_edge, _ = Att['edge'](e_t, edgebank_list)  # bnnh  这个b进去之后就成了length了，里面就没batch这一说了。
-        # msg_graph, _ = Att['graph'](graph_fts, graphbank_list)  # bh
+        # This way can also be helpful
+        # msg_node, weight1 = Att['node1'](nxt_hidden, nodebank_list, nodebank_list)
 
-        # 第二个实现版本 用input+当前步的hint去input+hint[0]的里面查   即用query_input  到里Knodebank_list，V值用nodebank_list
-        # Q:bnh  K 240 h V 240 h  ->msg_node :bn3h
-        #hofer 20240423
-
-        
-        # hofer 20240423 把nxt_hidden bnh加入到bank中，方法是对n进行聚合，因为bank里是b个h，已经对每个样本的node进行了聚合；试试能不能降低方差
-        # 以下为20240423前的bank注意力代码
-#        msg_node, weight1 = Att['node1'](nxt_hidden, nodebank_list, nodebank_list)  #bnh,?,?
-
-# 以下为了降低方差
-        nodebank_list = np.repeat(nodebank_list[np.newaxis, ...] ,nxt_hidden.shape[0], axis=0)
-        qself = jnp.sum(nxt_hidden,axis=1,keepdims = True)/nxt_hidden.shape[1];
-        nodebank_list = jnp.concatenate((qself,nodebank_list),axis = 1)
+        nodebank_list = np.repeat(nodebank_list[np.newaxis, ...], nxt_hidden.shape[0], axis=0)
+        qself = jnp.sum(nxt_hidden, axis=1, keepdims=True) / nxt_hidden.shape[1];
+        nodebank_list = jnp.concatenate((qself, nodebank_list), axis=1)
         msg_node, weight1 = Att['node1'](nxt_hidden, nodebank_list, nodebank_list)
-# 从这往上是2024 0423 hofer 改之后的代码，为了降低方差。
 
-        # 这里的weight拿出来，放在onestep的返回值里。
         weight = weight1
         ret = gatenet(nxt_hidden, msg_node)
-        # nxt_hidden = ret    # nxt_hidden不要动。
-        
-        h_t = jnp.concatenate([node_fts, hidden, ret], axis=-1)  # 打印一下这个shape，我猜是 (b, n, 128*3)
+        # nxt_hidden = ret
+
+        h_t = jnp.concatenate([node_fts, hidden, ret], axis=-1)
         # assert h_t.shape == (batch_size, nb_nodes, 128 * 3)
 
         # DECODE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1109,10 +900,10 @@ class NetChunked(Net):
                 mp_state.lstm_state)
         else:
             lstm_state = None
-        hiddens, output_preds, hint_preds, lstm_state, _ = self._one_step_pred(  # 最后一个_是weight，但是训练时不用，所以不接受
+        hiddens, output_preds, hint_preds, lstm_state, _ = self._one_step_pred(
             inputs, hints_for_pred, hiddens,
             batch_size, nb_nodes, lstm_state,
-            spec, encs, decs, repred, bank_list, Att, gatenet,use_bank)
+            spec, encs, decs, repred, bank_list, Att, gatenet, use_bank)
 
         new_mp_state = MessagePassingStateChunked(  # pytype: disable=wrong-arg-types  # numpy-scalars
             hiddens=hiddens, lstm_state=lstm_state, hint_preds=hint_preds,
@@ -1181,7 +972,7 @@ class NetChunked(Net):
         self.bankencoders = self._construct_encoders()
 
         node_bank = []
-        bank_list = []  # 0 1 2 点 边 图bank
+        bank_list = []
         if algorithm_index == -1:
             algorithm_indices = range(len(features_list))
         else:
@@ -1190,100 +981,58 @@ class NetChunked(Net):
 
         self.encoders, self.decoders = self._construct_single_encoders_decoders(algorithm_index,
                                                                                 self.spec[algorithm_index])
-        # 0201 hofer 测试原版代码
+
         # use_bank = False
         if use_bank:
-            for algo_index, feedback in enumerate(bank_feed):  # 这个for头就不动了
-                # 把一个算法的信息聚合成一个128的信息
+            for algo_index, feedback in enumerate(bank_feed):
+
                 inputs = feedback.features.inputs  # bank_batch*f...
-                hints = feedback.features.hints  # 原为bank_batch*f...  现为step*bank_batch*f
-                # lengths = feedback.features.lengths  # 这句话属是没用 暂时注释掉
+                hints = feedback.features.hints
                 batch_size, nb_nodes = _data_dimensions(feedback.features)
-                # nb_mp_steps = 16  # 因为我们这个step现在固定就是16步了
-
-                input_node_fts = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))  # b*n*h  一个样本有n个h，一个节点的特征是h
+                input_node_fts = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))
                 input_edge_fts = jnp.zeros(
-                    (batch_size, nb_nodes, nb_nodes, self.hidden_dim))  # b*n*n*h  一个边的特征是h，n个点有n*n个边。
-                input_graph_fts = jnp.zeros((batch_size, self.hidden_dim))  # bh
-
-                hint0_node_fts = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))  # b*n*h  一个样本有n个h，一个节点的特征是h
-                # hint0_edge_fts = jnp.zeros(
-                #     (batch_size, nb_nodes, nb_nodes, self.hidden_dim))  # b*n*n*h  一个边的特征是h，n个点有n*n个边。
-                # hint0_graph_fts = jnp.zeros((batch_size, self.hidden_dim))  # bh
+                    (batch_size, nb_nodes, nb_nodes, self.hidden_dim))
+                input_graph_fts = jnp.zeros((batch_size, self.hidden_dim))
+                hint0_node_fts = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))
 
                 encs = self.bankencoders[algo_index]
-                # if algo_index == algorithm_index:
-                #     encs = self.encoders[0]
-
-                # 对input进行encoder
                 for newdp in inputs:
-                    # data类型可能有bug
                     newdp = encoders.preprocess(newdp, nb_nodes)
                     assert newdp.type_ != _Type.SOFT_POINTER
                     encoder = encs[newdp.name]
                     input_node_fts = encoders.accum_node_fts(encoder, newdp, input_node_fts)  # bnh
                     input_edge_fts = encoders.accum_edge_fts(encoder, newdp, input_edge_fts)  # bnnh
                     input_graph_fts = encoders.accum_graph_fts(encoder, newdp, input_graph_fts)  # bh
-                # 对hint的第一步进行encoder，通过更改accum的实现做到的，结束后和input内容相加。
                 for dp in hints:
-                    dp = encoders.preprocess(dp, nb_nodes)  # 带着s维度去做这个hk.onehot会不会有问题？ 没问题应该这个功能是把每个数变成了一个向量
+                    dp = encoders.preprocess(dp, nb_nodes)
                     assert dp.type_ != _Type.SOFT_POINTER
-                    encoder = encs[dp.name]  # 下面都调用的是_step0 ，只会处理第0步的信息。a
+                    encoder = encs[dp.name]
                     hint0_node_fts = encoders.accum_node_fts_step0(encoder, dp, hint0_node_fts)  # bnh
-                    # hint0_edge_fts = encoders.accum_edge_fts_step0(encoder, dp, hint0_edge_fts)  # bnnh  dp.name dp.location node  dp.data.shape  step*batch*node
-                    # hint0_graph_fts = encoders.accum_graph_fts_step0(encoder, dp, hint0_graph_fts)  # bh
 
-                hint0_node_fts += input_node_fts  # bnh
-                # hint0_edge_fts += input_edge_fts  # bnnh  这个边的和图的暂且先不用了。
-                # hint0_graph_fts += input_graph_fts  # bh
-                # hint0_node_fts = jnp.sum(hint0_node_fts, axis=1) / nb_nodes
-                # 随机切片
+                hint0_node_fts += input_node_fts
                 rand_node = np.random.randint(0, nb_nodes)
                 hint0_node_fts = hint0_node_fts[:, rand_node]  # bh
                 assert hint0_node_fts.shape == (batch_size, 128)
 
-
-                # 对全部的hints进行encoder
                 for dp in hints:
                     lengths = feedback.features.lengths
                     tempdata = jnp.sum(dp.data, axis=0)
                     dp.data = tempdata / _iso_expand_to(lengths, tempdata)
-                    dp = encoders.preprocess(dp, nb_nodes)  # 带着s维度去做这个hk.onehot会不会有问题？ 没问题应该这个功能是把每个数变成了一个向量
+                    dp = encoders.preprocess(dp, nb_nodes)
                     assert dp.type_ != _Type.SOFT_POINTER
-                    encoder = encs[dp.name]  # 从字典中索引出这个name对应的 “encoder们”   encoder是个list。
+                    encoder = encs[dp.name]
                     input_node_fts = encoders.accum_node_fts(encoder, dp, input_node_fts)  # bnh
                     input_edge_fts = encoders.accum_edge_fts(encoder, dp, input_edge_fts)  # bnnh
                     input_graph_fts = encoders.accum_graph_fts(encoder, dp, input_graph_fts)  # bh
 
-                # input_node_fts = input_node_fts[:, rand_node]  # bnh->bh
                 input_node_fts = jnp.sum(input_node_fts, axis=1)  # bnh->bh
-                input_edge_fts = jnp.sum(input_edge_fts, axis=(1, 2))  # bnnh->bh
-                # input_graph_fts = jnp.sum(input_graph_fts, axis=(0))  # bh->bh
-                # hofer 0117
-                #            one_hot_vector = jnp.zeros(bank_length)
-                #            one_hot_vector = one_hot_vector.at[algo_index].set(1.0)
-                #            pos_embedding = pos_Linear(one_hot_vector)
-                #            node_bank.append(input_node_fts / (batch_size * nb_nodes) + pos_embedding)
-                #            edge_bank.append(input_edge_fts / batch_size + pos_embedding)
-                #            graph_bank.append(input_graph_fts / batch_size + pos_embedding)
-                # hofer 0117
-                # before 0117
                 temp = input_node_fts / (nb_nodes)
-                # temp = input_node_fts
-                #            temp = jax.nn.tanh(nodehint_Linear(temp))
-                #            temp = jax.nn.relu(temp)
                 temp = jax.nn.tanh(temp)
                 for i in range(temp.shape[0]):
                     t = temp[i]
                     node_bank.append(t)
-
-                # before 0117
-
-        #  有关bank的一切结束。
         bank_list.append(node_bank)  # 0
 
-        # 创建3个ATT网络  change by hofer 12.11
-        # 不该是3个，而是每个算法对应一套。  # hofer 1226
         qkv_list = []
         for i in [1]:
             node_Attention1 = AttNet(model_size=128, name='node_Q_Attbank')
@@ -1401,7 +1150,7 @@ def _expand_to(x: _Array, y: _Array) -> _Array:
     return x
 
 
-def _iso_expand_to(x, y):  # 为什么要iso独立出来？因为length不要在原文的基础上和data看齐，边的data和点的data shape不同
+def _iso_expand_to(x, y):
     z = copy.deepcopy(x)
     while len(y.shape) > len(z.shape):
         z = jnp.expand_dims(z, -1)

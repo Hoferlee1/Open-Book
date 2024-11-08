@@ -150,7 +150,7 @@ class BaselineModel(model.Model):
             encoder_init: str = 'default',
             use_lstm: bool = False,
             learning_rate: float = 0.005,
-            grad_clip_max_norm: float = 0.0,  # train model传进来的是1
+            grad_clip_max_norm: float = 0.0,
             checkpoint_path: str = '/tmp/clrs3',
             freeze_processor: bool = False,
             dropout_prob: float = 0.0,
@@ -223,28 +223,23 @@ class BaselineModel(model.Model):
                            optax.scale(-learning_rate)]
             self.opt = optax.chain(*optax_chain)
         else:
-            self.opt = optax.adam(learning_rate)  # 虽然不走这条分支，但是你就把self.opt当成optimizer来用就好
-            # optimizer三个基本用法，init返回optstate，以及update返回调整过的grads（它叫updates）和opt_state,以及apply_updates，返回新param
+            self.opt = optax.adam(learning_rate)
 
         self.nb_msg_passing_steps = nb_msg_passing_steps
 
-        self.nb_dims = []  # 列表里是30个字典，每个字典以name：data最后一维的 键值对保存信息。
-        # 这个东西创建Net实例的时候要用，然后Net在自己里面construct encoder decoder的时候要用。
+        self.nb_dims = []
         if isinstance(dummy_trajectory, _Feedback):
             assert len(self._spec) == 1
             dummy_trajectory = [dummy_trajectory]
-        for traj in dummy_trajectory:  # 对于dummy里的每个Feedback，每个Feedback代表了一个算法，这个是64个batch后的
+        for traj in dummy_trajectory:
             nb_dims = {}
-            for inp in traj.features.inputs:  # 对于一个Feedback里的每个input下的dp，创建一组这样的kv组合name：注意dummy是val中拿的，也就是node规模是16
-                # 例如'pos': pos对应的data最后一维的长度。
+            for inp in traj.features.inputs:
                 nb_dims[inp.name] = inp.data.shape[-1]
             for hint in traj.features.hints:
                 nb_dims[hint.name] = hint.data.shape[-1]
             for outp in traj.outputs:
                 nb_dims[outp.name] = outp.data.shape[-1]
-            self.nb_dims.append(nb_dims)  # 为什么要专门取最后一维呢？，nb_dims以键值对的方式记录了每个name对应的最后一维数据维度。
-
-        # 这里调用的_create_net_fns方法目的就是创建几个self.内容。
+            self.nb_dims.append(nb_dims)
         self._create_net_fns(hidden_dim, encode_hints, processor_factory, use_lstm,
                              encoder_init, dropout_prob, hint_teacher_forcing,
                              hint_repred_mode)
@@ -256,7 +251,7 @@ class BaselineModel(model.Model):
     def _create_net_fns(self, hidden_dim, encode_hints, processor_factory,
                         use_lstm, encoder_init, dropout_prob,
                         hint_teacher_forcing, hint_repred_mode):
-        def _use_net(*args, **kwargs):  # 这个函数等于hk官方用法里的那个def forward，用于包装一下网络然后transform的。
+        def _use_net(*args, **kwargs):
             return nets.Net(self._spec, hidden_dim, encode_hints, self.decode_hints,
                             processor_factory, use_lstm, encoder_init,
                             dropout_prob, hint_teacher_forcing,
@@ -267,13 +262,13 @@ class BaselineModel(model.Model):
         pmap_args = dict(axis_name='batch', devices=jax.local_devices())
         n_devices = jax.local_device_count()
         func, static_arg, extra_args = (
-            # extra_args定义为一个空字典，下面用jit加速的函数，似乎要给出字典中key是'static_argnums'的时候，对应value是几个静态参数
-            (jax.jit, 'static_argnums', {}) if n_devices == 1 else  # jax.jit的函数别名就是func，
-            (jax.pmap, 'static_broadcasted_argnums', pmap_args))  # 我们的是1，所以不考虑pmap的并行了。
+
+            (jax.jit, 'static_argnums', {}) if n_devices == 1 else
+            (jax.pmap, 'static_broadcasted_argnums', pmap_args))
         pmean = functools.partial(jax.lax.pmean, axis_name='batch')
         self._maybe_pmean = pmean if n_devices > 1 else lambda x: x
         extra_args[static_arg] = 3
-        self.jitted_grad = func(self._compute_grad, **extra_args)  # 'static_argnums' = 3 指明第几个位置的参数是静态参数。
+        self.jitted_grad = func(self._compute_grad, **extra_args)
         extra_args[static_arg] = 4
         self.jitted_feedback = func(self._feedback, donate_argnums=[0, 3],
                                     **extra_args)
@@ -295,7 +290,7 @@ class BaselineModel(model.Model):
         self.opt_state = self.opt.init(self.params)
         # We will use the optimizer state skeleton for traversal when we
         # want to avoid updating the state of params of untrained algorithms.
-        self.opt_state_skeleton = self.opt.init(jnp.zeros(1))  # skeleton的作用暂时未知。
+        self.opt_state_skeleton = self.opt.init(jnp.zeros(1))
 
     @property
     def params(self):
@@ -380,11 +375,11 @@ class BaselineModel(model.Model):
             algorithm_index = 0
         # Calculate and apply gradients.
         rng_keys = _maybe_pmap_rng_key(rng_key)  # pytype: disable=wrong-arg-types  # numpy-scalars
-        feedback = _maybe_pmap_data(feedback)  # 这两步是考虑了多卡加速，我们用不到。
+        feedback = _maybe_pmap_data(feedback)
         loss, self._device_params, self._device_opt_state = self.jitted_feedback(
             self._device_params, rng_keys, feedback,
             self._device_opt_state, algorithm_index, bank_list)
-        loss = _maybe_pick_first_pmapped(loss)  # 这个同理，无事发生。
+        loss = _maybe_pick_first_pmapped(loss)
         return loss
 
     def predict(self, rng_key: hk.PRNGSequence, features: _Features,
@@ -407,11 +402,11 @@ class BaselineModel(model.Model):
 
     def _loss(self, params, rng_key, feedback, algorithm_index, bank_list):
         """Calculates model loss f(feedback; params)."""
-        output_preds, hint_preds, _ = self.net_fn.apply(  # 看看net的网络，一次前向传播，会返回什么东西出来？这俩返回值都是个啥？
-            params, rng_key, [feedback.features],  # 这两个返回的东西，一个是所有的output的预测，一个是所有的hint的预测
-            repred=False,  # 我们改写的时候这里要返回一个list，list里面装了这两个二元组。list大小是30个。
-            algorithm_index=algorithm_index,  # 然后从下面开始，写个for循环，依次加和30个的loss，最后可以考虑除以30。
-            return_hints=True,  # feedback要依次索引出来。
+        output_preds, hint_preds, _ = self.net_fn.apply(
+            params, rng_key, [feedback.features],
+            repred=False,
+            algorithm_index=algorithm_index,
+            return_hints=True,
             return_all_outputs=False,
             bank_feed=bank_list)
 
@@ -421,14 +416,14 @@ class BaselineModel(model.Model):
 
         # Calculate output loss.
         for truth in feedback.outputs:
-            total_loss += losses.output_loss(  # losses.py下的output_loss函数，label，预测，以及node数量。不过这里的预测格式是？
+            total_loss += losses.output_loss(
                 truth=truth,
                 pred=output_preds[truth.name],
                 nb_nodes=nb_nodes,
             )
 
         # Optionally accumulate hint losses.
-        if self.decode_hints:  # 默认是开的，这一项的意思是是否把hint当作输出，当然...
+        if self.decode_hints:
             for truth in feedback.features.hints:
                 total_loss += losses.hint_loss(
                     truth=truth,
@@ -439,17 +434,17 @@ class BaselineModel(model.Model):
 
         return total_loss
 
-    def _update_params(self, params, grads, opt_state, algorithm_index, use_bank):  # 这个函数完成了对旧参数，刚出炉的grad，以及旧opt_state的改造
-        # 返回一个新参数，新opt，在这个函数里有
-        # 0131hofer  # bank_filter_null_grads()
-        if use_bank:   # 用了bank那就全部更新
+    def _update_params(self, params, grads, opt_state, algorithm_index, use_bank):
+
+
+        if use_bank:
             updates, opt_state = bank_filter_null_grads(
                 grads, self.opt, opt_state, self.opt_state_skeleton,
                 None)
-        else: # 这轮不更新有关bank的网络
+        else:
             updates, opt_state = bank_filter_null_grads(
                 grads, self.opt, opt_state, self.opt_state_skeleton,
-                algorithm_index)  # 这个函数可以拿到调整后的updates和新的opt_state hofer 0124嘴后一个设置成None用来更新所有的参数
+                algorithm_index)
         if self._freeze_processor:
             params_subset = _filter_out_processor(params)
             updates_subset = _filter_out_processor(updates)
@@ -458,7 +453,7 @@ class BaselineModel(model.Model):
             new_params = optax.apply_updates(params_subset, updates_subset)
             new_params = hk.data_structures.merge(params, new_params)
         else:
-            new_params = optax.apply_updates(params, updates)  # 这里的updates就是优化器调整过后的。
+            new_params = optax.apply_updates(params, updates)
 
         return new_params, opt_state
 
@@ -562,34 +557,31 @@ class BaselineModelChunked(BaselineModel):
                 hint_preds=None, hiddens=None, lstm_state=None)
 
         empty_mp_states = [[_empty_mp_state() for _ in f] for f in features_list]
-        # empty_mp_states有5个list
+
         dummy_params = [self.net_fn.init(rng_key, f, e, False,
                                          init_mp_state=True, algorithm_index=algo_idx, bank_feed=copy.deepcopy(bank_list),
                                          use_bank=use_bank)
                         for (f, e) in zip(features_list, empty_mp_states)]
-        # 这两个5个元素的的list，一一对应，分别调用5次init，返回5个对应的dummy_params，当然每一组都是30个算法的所有params。
-        # dummy_params会拿到一个param的list，相较于BaselineModel的init来说，这个的param会有5组。对应第5个不同的node长度
+
         mp_states = [
             self.net_fn.apply(d, rng_key, f, e, False,
                               init_mp_state=True, algorithm_index=algo_idx, bank_feed=copy.deepcopy(bank_list), use_bank=use_bank)[1]
             for (d, f, e) in zip(dummy_params, features_list, empty_mp_states)]
-        # mp_states也是一个5个元素的list，每个元素是一个list，这个list里面又有30个算法的mp_state
-        # 不过每个算法的mp_state有点奇怪，里面input hint isfirst都是一步的。。。
+
         return mp_states
 
     def init(self,
-             features: List[List[_FeaturesChunked]],  # 一个list包含了5组list，详情见run.py
+             features: List[List[_FeaturesChunked]],
              seed: _Seed, bank_list, algo_idx):
         self.mp_states = self._init_mp_state(features,
                                              jax.random.PRNGKey(seed),
                                              bank_list, algo_idx,
                                              True)  # pytype: disable=wrong-arg-types  # jax-ndarray
         self.init_mp_states = [list(x) for x in self.mp_states]
-        # 搞了一个上面的复制，不过这个init_mp以后就不改了，只从里面取数。
         self.params = self.net_fn.init(
             jax.random.PRNGKey(seed), features[0], self.mp_states[0],  # pytype: disable=wrong-arg-types  # jax-ndarray
-            True, init_mp_state=False, algorithm_index=algo_idx,  # hofer 原本为-1
-            bank_feed=copy.deepcopy(bank_list), use_bank=True)  # 这俩下标0就是说都取第一个node长度的，因为feature是来自第一个node长度。
+            True, init_mp_state=False, algorithm_index=algo_idx,
+            bank_feed=copy.deepcopy(bank_list), use_bank=True)
         self.opt_state = self.opt.init(self.params)
         # We will use the optimizer state skeleton for traversal when we
         # want to avoid updating the state of params of untrained algorithms.
@@ -707,7 +699,7 @@ class BaselineModelChunked(BaselineModel):
         raise NotImplementedError
 
 
-def _nb_nodes(feedback: _Feedback, is_chunked) -> int:  # 根据输入的dp返回图中的节点个数
+def _nb_nodes(feedback: _Feedback, is_chunked) -> int:
     for inp in feedback.features.inputs:
         if inp.location in [_Location.NODE, _Location.EDGE]:
             if is_chunked:
@@ -864,25 +856,19 @@ def bank_filter_null_grads(grads, opt, opt_state, opt_state_skeleton, algo_idx):
         """Ignore params of encoders/decoders irrelevant for this algo."""
         # Note: in shared pointer decoder modes, we should exclude shared params
         #       for algos that do not have pointer outputs.
-        # 这里是原文的做法，挑出processor和当前算法下标的字眼的对应模型进行更新，
-        # 但是这个在我们这里是不合适的，因为我们有些模型，尤其是Att那边的没有名字的。。
-        # 所以我们改成挑出bank的，如果有bank字眼，不更新，也就是返回None，其余的正常返回v，和他这个相反。
         # if ((processors.PROCESSOR_TAG in k) or
         #         (f'algo_{algo_idx}_' in k)):
         #     return v
         # return jax.tree_util.tree_map(lambda x: None, v)
-        if ('bank' in k):  # 所有带bank字眼的，都不更新，这就要求我们把所有和bank有关的网络都加上这个bank...
+        if ('bank' in k):
             return jax.tree_util.tree_map(lambda x: None, v)
         return v
 
-    #    print(f'grads:{grads}')
-    #    print(f'len(grads){len(grads)}')
     if algo_idx is None:
         masked_grads = grads
     else:
         masked_grads = {k: _keep_in_algo(k, v) for k, v in grads.items()}
-    #        print(f'maskgrads{masked_grads}')
-    #        print(f'len(maskgrads){len(masked_grads)}')
+
     flat_grads, treedef = jax.tree_util.tree_flatten(masked_grads)
     flat_opt_state = jax.tree_util.tree_map(
         lambda _, x: x  # pylint:disable=g-long-lambda

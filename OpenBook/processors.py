@@ -35,12 +35,11 @@ class Bank_selfAtt(hk.Module):
         super().__init__(name=name)
 
     def __call__(self, bank_list):
-        # print(bank_list.shape)
+
         nb_batch = bank_list.shape[0]
         bank_list = jnp.expand_dims(bank_list, axis=-1)  # 30, 128, 1
         inner_Linear = hk.Linear(4)
         bank_list = inner_Linear(bank_list)  # (30, 128, 4)
-        # print(bank_list.shape)
 
         bank_list = jnp.reshape(bank_list, (nb_batch, 128 * 4))  # (30, 512)
         H = 128 * 4
@@ -55,20 +54,20 @@ class Bank_selfAtt(hk.Module):
         V = Wv(bank_list)  # 30, 128 * 4
 
         K = jnp.transpose(K, (1, 0))
-        QK = jnp.matmul(Q, K)  # 30, 30 第一个是查询次数，第二个是被查询的个数，也就是和为1的那个last_dim
+        QK = jnp.matmul(Q, K)
         QK = QK * scale
         QK = jax.nn.softmax(QK, axis=-1)
         QKV = jnp.matmul(QK, V)  # 30, 128 * 4
 
-        # 第一组DataPoint之间的注意力做完后，还要加MLP或者别的东西吗？先只让原来的加上，或者用结果直接往后做？先直接加
+
         QKV = bank_list + QKV
         Ln_dp = hk.LayerNorm(axis=-1, param_axis=-1, create_scale=True, create_offset=True)
-        QKV = Ln_dp(QKV)  # 这个LN未来可测一下作用大不大
-        # 接下来做 特征之间的注意力。
+        QKV = Ln_dp(QKV)
+
         DP = jnp.reshape(QKV, (nb_batch, 128, 4))  # (30, 128, 4)
 
         scale1 = 1.0 / 8
-        Wq1 = hk.Linear(8)  # 4->8  QK都是8做点积
+        Wq1 = hk.Linear(8)  # 4->8
         Wk1 = hk.Linear(8)  # 4->8
         Wv1 = hk.Linear(4)  # 4->4
 
@@ -76,13 +75,13 @@ class Bank_selfAtt(hk.Module):
         K1 = Wk1(DP)  # 30, 128, 8
         V1 = Wv1(DP)  # 30, 128, 4
         K1 = jnp.transpose(K1, (0, 2, 1))  # 30, 8 128
-        QK1 = jnp.matmul(Q1, K1)  # 30, 128, 128  # 最后一个128是lastdim，符合我们的设想，拿一组特征当bank，一共128个这样的特征。
+        QK1 = jnp.matmul(Q1, K1)  # 30, 128, 128
         QK1 = QK1 * scale1
         QK1 = jax.nn.softmax(QK1, axis=-1)
         assert QK1.shape == (nb_batch, 128, 128)
         assert V1.shape == (nb_batch, 128, 4)
         QKV1 = jnp.matmul(QK1, V1)  # 30, 128, 4
-        # 残差网络 or ...Ln是否要实现？过了最后这个Linear和reshape再实现，因为bank里的数字要搞小一点。
+
         QKV1 = QKV1 + DP
 
         out_Linear = hk.Linear(1)
@@ -394,13 +393,13 @@ class PGN(Processor):
 
     def __init__(
             self,
-            out_size: int,  # 这个大小是什么？run里定义的 128维的 hidden_dims
+            out_size: int,
             mid_size: Optional[int] = None,
             mid_act: Optional[_Fn] = None,
             activation: Optional[_Fn] = jax.nn.relu,
             reduction: _Fn = jnp.max,
             msgs_mlp_sizes: Optional[List[int]] = None,
-            use_ln: bool = True,  # 这个是开的
+            use_ln: bool = True,
             use_triplets: bool = False,
             nb_triplet_fts: int = 8,
             gated: bool = False,
@@ -426,22 +425,22 @@ class PGN(Processor):
             node_fts: _Array,
             edge_fts: _Array,
             graph_fts: _Array,
-            adj_mat: _Array,  # trib mpnn 这个是全1的。
-            hidden: _Array,  # bnh
+            adj_mat: _Array,
+            hidden: _Array,
             Att=None,
             bank_list=None,
             use_bank=None,
             **unused_kwargs,
     ):
         """MPNN inference step."""
-        # 先搞清楚三个fts和hidden区别在哪儿？三个fts是每轮
+
         b, n, last = node_fts.shape  # b*n*h
         assert edge_fts.shape[:-1] == (b, n, n)  # b*n*n*h
         assert graph_fts.shape[:-1] == (b,)  # b*h
         assert adj_mat.shape == (b, n, n)  # b*n*n
 
         z = jnp.concatenate([node_fts, hidden], axis=-1)  # b n 2h
-        # 接下来搞了4+2个网络，前四个outputsize是mid_size，后两个是out_size 在这里是一样的，我们定义网络的时候给的总ouputsize
+
         m_1 = hk.Linear(self.mid_size)
         m_2 = hk.Linear(self.mid_size)
         m_e = hk.Linear(self.mid_size)
@@ -450,18 +449,12 @@ class PGN(Processor):
         o1 = hk.Linear(self.out_size)
         o2 = hk.Linear(self.out_size)
 
-        msg_1 = m_1(z)  # b*n*h （h就是outsize,是一样的 都是128
+        msg_1 = m_1(z)  # b*n*h
         msg_2 = m_2(z)
         msg_e = m_e(edge_fts)  # b*n*n*h
         msg_g = m_g(graph_fts)  # b*h
 
-        #  位置编码
-        # onehot_matrix = jnp.eye(len(bank_list[0]))  # len(bank_list[0])
-        # pos_Linear = hk.Linear(128)
-        # pos_embedding = pos_Linear(onehot_matrix)
-        # pos_embedding = jax.nn.tanh(pos_embedding)
 
-        # print(f'bank到底多长？{len(bank_list)}')
         o3 = hk.Linear(self.out_size)
         mlp1 = hk.nets.MLP(self._msgs_mlp_sizes)
         gate1 = hk.Linear(self.out_size)
@@ -476,33 +469,26 @@ class PGN(Processor):
             ln3 = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
             nodebank_list = ln1(nodebank_list)
 
-            #  位置编码
-            # nodebank_list = nodebank_list+pos_embedding
-
-            # 对bank加两层内部的自注意力处理
             nodeBankAttNet = Bank_selfAtt(name='nodebank')
             edgeBankAttNet = Bank_selfAtt(name='edgebank')
             graphBankAttNet = Bank_selfAtt(name='graphbank')
             nodebank_list = nodeBankAttNet(nodebank_list)
 
-            msg_3, weight1 = Att['node1'](z, nodebank_list)  # b n 2h -->b n h 因为modelsize是h
-            # msg_3 = m_Att(msg_3) # b n h
-            # ========================= 04 版node
+            msg_3, weight1 = Att['node1'](z, nodebank_list)  # b n 2h -->b n h
 
-            # edge graph ATT
-            edgebank_list = jnp.stack(bank_list[1])  # 取出边和图的bank，shape = 30*h 当作ATT的y使用。
+            edgebank_list = jnp.stack(bank_list[1])
             graphbank_list = jnp.stack(bank_list[2])
             edgebank_list = ln2(edgebank_list)
             graphbank_list = ln3(graphbank_list)
             edgebank_list = edgeBankAttNet(edgebank_list)
             graphbank_list = graphBankAttNet(graphbank_list)
 
-            edge_input = jnp.sum(edge_fts, axis=(1, 2))  # bh 注意不要直接对edge_fts和graph_fts操作，因为下面还要用这两个原始数据。
+            edge_input = jnp.sum(edge_fts, axis=(1, 2))
             graph_input = graph_fts  # bh
-            edge_res, _ = Att['edge'](edge_input, edgebank_list)  # bh  这个b进去之后就成了length了，里面就没batch这一说了。
-            graph_res, _ = Att['graph'](graph_input, graphbank_list)  # bh
+            edge_res, _ = Att['edge'](edge_input, edgebank_list)
+            graph_res, _ = Att['graph'](graph_input, graphbank_list)
 
-            edge_fts += jnp.expand_dims(edge_res, (1, 2))  # bnnh  +bh扩维
+            edge_fts += jnp.expand_dims(edge_res, (1, 2))
             graph_fts += graph_res
 
             tri_msgs = None
@@ -517,12 +503,12 @@ class PGN(Processor):
                 if self.activation is not None:
                     tri_msgs = self.activation(tri_msgs)  # 似是relu
 
-            msgs = (  # 这4个刚才经过线性层的msg，维度不一致，现在提升到一致的，现在分别是b1nh  bn1h  bnnh  b11h 这四个加一起合成msgs:bnnh
+            msgs = (
                     jnp.expand_dims(msg_1, axis=1) + jnp.expand_dims(msg_2, axis=2) +
                     msg_e + jnp.expand_dims(msg_g, axis=(1, 2)))
 
-            if self._msgs_mlp_sizes is not None:  # [outputsize, outputsize] 传进来的是这个格式
-                msgs = mlp1(jax.nn.relu(msgs))  # 这里拿融合后的msgs relu后进入一个两层的MLP，输出维度依然是bnnh
+            if self._msgs_mlp_sizes is not None:
+                msgs = mlp1(jax.nn.relu(msgs))
                 
 
             if self.mid_act is not None:  # None
@@ -531,24 +517,24 @@ class PGN(Processor):
             if self.reduction == jnp.mean:
                 msgs = jnp.sum(msgs * jnp.expand_dims(adj_mat, -1), axis=1)
                 msgs = msgs / jnp.sum(adj_mat, axis=-1, keepdims=True)
-            elif self.reduction == jnp.max:  # 默认是这个
-                maxarg = jnp.where(jnp.expand_dims(adj_mat, -1),  # 邻接矩阵从bnn扩展到bnn1，然后对bnnh进行选择，由于adj是全1的，所以结果就是msgs
+            elif self.reduction == jnp.max:
+                maxarg = jnp.where(jnp.expand_dims(adj_mat, -1),
                                    msgs,
-                                   -BIG_NUMBER)  # -1e6 ，所以这个maxarg是bnnh维度，然后邻接矩阵是1的位置换上这个msg信息，是0的位置换上这个-1e6的负数。
-                msgs = jnp.max(maxarg, axis=1)  # 在第一个维度上挑个最大的，然后变成bnh了
+                                   -BIG_NUMBER)
+                msgs = jnp.max(maxarg, axis=1)
             else:
                 msgs = self.reduction(msgs * jnp.expand_dims(adj_mat, -1), axis=1)
 
             h_1 = o1(z)  # bnh
             h_2 = o2(msgs)  # bnh
 
-            if self.gated:  # 默认True
+            if self.gated:
                 
                 msg3_gate = gate4(msg_3)  # hk.nn.relu  hk.nn.tanh
                 msg3_gate = jax.nn.sigmoid(msg3_gate)
-                ret = h_1 + h_2 + msg_3 * msg3_gate  # bnh hofer 0125
+                ret = h_1 + h_2 + msg_3 * msg3_gate
                 if self.activation is not None:
-                    ret = self.activation(ret)  # 经过一个relu
+                    ret = self.activation(ret)
 
                 if self.use_ln:
                     ln = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
@@ -562,7 +548,7 @@ class PGN(Processor):
                 # Triplet messages, as done by Dudzik and Velickovic (2022)
                 triplets = get_triplet_msgs(z, edge_fts, graph_fts, self.nb_triplet_fts)
 
-                tri_msgs = o3(jnp.max(triplets, axis=1))  # (B, N, N, H)
+                tri_msgs = o3(jnp.max(triplets, axis=1))
 
                 if self.activation is not None:
                     tri_msgs = self.activation(tri_msgs)
@@ -606,7 +592,7 @@ class PGN(Processor):
             weight1 = jnp.array([[2.2],[2.2]])
 
         return ret, tri_msgs, (weight1[0],)  # pytype: disable=bad-return-type  # numpy-scalars
-        # 第一个推测一下维度是多少... 第二个返回值没用
+
 
 
 class DeepSets(PGN):

@@ -94,13 +94,13 @@ class Sampler(abc.ABC):
         self._algorithm = algorithm
         self._args = args
         self._kwargs = kwargs
-        self.bank = bank  # hofer 0203
+        self.bank = bank
 
         if num_samples < 0:
             logging.warning('Sampling dataset on-the-fly, unlimited samples.')
             # Just get an initial estimate of max hint length
             self.max_steps = -1
-            for _ in range(1000):  # hofer 1226设置的大一点。原来是1000，现在改成1W2a
+            for _ in range(1000):
                 data = self._sample_data(*args, **kwargs)
                 _, probes = algorithm(*data)
                 _, _, hint = probing.split_stages(probes, spec)
@@ -127,20 +127,17 @@ class Sampler(abc.ABC):
             inp, outp, hint = probing.split_stages(probes, spec)
             inputs.append(inp)
             outputs.append(outp)
-            hints.append(hint)  # hint是个list，list里面的每种hint数据dp，shape 前两维, step * 1 *...
+            hints.append(hint)
             if len(hints) % 1000 == 0:
                 logging.info('%i samples created', len(hints))
 
         # Batch and pad trajectories to max(T).
         inputs = _batch_io(inputs)  # batch * f...
         outputs = _batch_io(outputs)
-        # hints, lengths = _batch_hints(hints, min_length)
-        # hofer 0203                                                # batch * feature
-        nb_nodes = self._kwargs['length']  # 拿到这轮的节点个数
 
         if self.bank:
             hints, lengths = _batch_hints_step(hints,
-                                               min_length)  # 2 * batch * node   lengths:batch个长度的一维np  batch*step*node*f reshape = batch* stepnode *f
+                                               min_length)
         else:
             hints, lengths = _batch_hints(hints, min_length)
 
@@ -160,22 +157,11 @@ class Sampler(abc.ABC):
                 inputs, outputs, hints, lengths = self._make_batch(
                     batch_size, self._spec, self.max_steps,
                     self._algorithm, *self._args, **self._kwargs)
-                # hofer 1226
-                # ========================================origin version
 
                 if hints[0].data.shape[0] > self.max_steps:
                     logging.warning('Increasing hint lengh from %i to %i',
                                     self.max_steps, hints[0].data.shape[0])
                     self.max_steps = hints[0].data.shape[0]
-
-            # ========================================= hofer version
-            #        while hints[0].data.shape[0] > self.max_steps:
-            #            logging.warning('Error hint lengh  %i',
-            #                                    hints[0].data.shape[0])
-            #            inputs, outputs, hints, lengths = self._make_batch(batch_size, self._spec, self.max_steps,
-            #            self._algorithm, *self._args, **self._kwargs)
-            #            logging.warning('Error hint lengh regenerated from max_step %i to %i',
-            #            self.max_steps, hints[0].data.shape[0])
 
             else:
                 if batch_size > self._num_samples:
@@ -280,7 +266,7 @@ class Sampler(abc.ABC):
 
 def build_sampler(
         name: str,
-        bank: bool,  # hofer 0203
+        bank: bool,
         num_samples: int,
         *args,
         seed: Optional[int] = None,
@@ -299,7 +285,7 @@ def build_sampler(
     if set(clean_kwargs) != set(kwargs):
         logging.warning('Ignoring kwargs %s when building sampler class %s',
                         set(kwargs).difference(clean_kwargs), sampler_class)
-    sampler = sampler_class(algorithm, spec, num_samples, seed=seed, bank=bank,  # hofer 0203
+    sampler = sampler_class(algorithm, spec, num_samples, seed=seed, bank=bank,
                             *args, **clean_kwargs)
     return sampler, spec
 
@@ -726,21 +712,17 @@ def _batch_hints_step(
       and a |sample| list containing the length of each trajectory.
     """
 
-    # max_steps = min_steps  # hofer 1221 保证只和32个保持一致就好了。
+
     max_steps = 2
     assert traj_hints  # non-empty
-    for sample_hint in traj_hints:  # 每一个算法实例
-        # 这里相当于拿了时间维度，看一共有几步，t就是当前算法实例的总时间步
-        t = sample_hint[0].data.shape[0] - 1  # 一个算法实例是一个list，list里面是不同的datapoint，shape都是一样的，但是具体表示的数据信息不同（颜色位置）。
+    for sample_hint in traj_hints:
+        t = sample_hint[0].data.shape[0] - 1
         if t < 2:
             continue
-        rand_step = np.random.randint(0, t)  # 随机出来那一步 范围[0, t)
+        rand_step = np.random.randint(0, t)
         for dp in sample_hint:
             assert dp.data.shape[1] == 1  # batching axis
-            #  hofer 0203 从随机数开始取两步的
-            dp.data = dp.data[rand_step:rand_step + 2]  # 左闭右开，所以是含着起点的两步。
-            # if dp.data.shape[0] > max_steps:   # rand_step  dp.data = dp.data[rand_step:rand_step + 2]
-            #     max_steps = dp.data.shape[0]
+            dp.data = dp.data[rand_step:rand_step + 2]
     time_and_batch = (max_steps, len(traj_hints))
 
     # Create zero-filled space for the batched hints, then copy each hint
@@ -780,13 +762,12 @@ def _batch_hints(
       and a |sample| list containing the length of each trajectory.
     """
 
-    max_steps = min_steps  # hofer 1221 保证只和32个保持一致就好了。，
+    max_steps = min_steps
     assert traj_hints  # non-empty
     for sample_hint in traj_hints:
         for dp in sample_hint:
             assert dp.data.shape[1] == 1  # batching axis
-            #  hofer 1221 不再让他永远和最大的保持一致，只用和当前的batch里最大的一致就好了。。
-            if dp.data.shape[0] > max_steps:  # rand_step  dp.data = dp.data[rand_step:rand_step + 2]
+            if dp.data.shape[0] > max_steps:
                 max_steps = dp.data.shape[0]
     time_and_batch = (max_steps, len(traj_hints))
 
